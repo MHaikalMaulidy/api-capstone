@@ -15,7 +15,7 @@ app = Flask(__name__)
 # Hugging Face API Configuration
 HF_API_TOKEN = os.environ.get('HF_TOKEN')
 HF_SUMMARY_URL = "https://api-inference.huggingface.co/models/fransiskaarthaa/text-summarize"
-HF_QUESTION_URL = "https://api-inference.huggingface.co/models/meilanikizana/question-generation-indonesia"
+HF_QUESTION_URL = "meilanikizana/indonesia-question-generation-model"
 
 def summarize_with_api(text, max_length=150):
     """Gunakan Hugging Face Inference API untuk summarization"""
