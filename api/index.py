@@ -2,8 +2,8 @@ from flask import Flask, request, jsonify
 import requests
 import logging
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -13,19 +13,14 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Hugging Face API Configuration
-HF_API_TOKEN = os.environ.get('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')
-HF_SUMMARY_URL = "https://api-inference.huggingface.co/models/fransiskaarthaa/text-summarize"
-HF_QUESTION_URL = "https://api-inference.huggingface.co/models/meilanikizana/indonesia-question-generation-model"
+HF_API_TOKEN = os.environ.get('HF_TOKEN')  # Set di Replit Secrets
+HF_SUMMARY_URL = "fransiskaarthaa/text-summarize"
+HF_QUESTION_URL = "meilanikizana/question-generation-indonesia"
 
 def summarize_with_api(text, max_length=150):
     """Gunakan Hugging Face Inference API untuk summarization"""
-    if not HF_API_TOKEN:
-        logger.warning("No HF_TOKEN available for summarization")
-        return None
-        
     headers = {
-        "Authorization": f"Bearer {HF_API_TOKEN}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {HF_API_TOKEN}" if HF_API_TOKEN else None
     }
     
     payload = {
@@ -38,26 +33,16 @@ def summarize_with_api(text, max_length=150):
     }
     
     try:
-        response = requests.post(HF_SUMMARY_URL, headers=headers, json=payload, timeout=30)
+        response = requests.post(HF_SUMMARY_URL, headers=headers, json=payload)
         
         if response.status_code == 200:
             result = response.json()
             if isinstance(result, list) and len(result) > 0:
                 return result[0].get('summary_text', '')
             return result.get('summary_text', '')
-        elif response.status_code == 503:
-            # Model loading, retry once after delay
-            logger.info("Model loading, retrying in 10 seconds...")
-            time.sleep(10)
-            response = requests.post(HF_SUMMARY_URL, headers=headers, json=payload, timeout=30)
-            if response.status_code == 200:
-                result = response.json()
-                if isinstance(result, list) and len(result) > 0:
-                    return result[0].get('summary_text', '')
-                return result.get('summary_text', '')
-        
-        logger.error(f"Summary API Error: {response.status_code} - {response.text}")
-        return None
+        else:
+            logger.error(f"Summary API Error: {response.status_code} - {response.text}")
+            return None
             
     except Exception as e:
         logger.error(f"Summary request error: {e}")
@@ -65,19 +50,15 @@ def summarize_with_api(text, max_length=150):
 
 def generate_questions_with_api(text, num_questions=3):
     """Gunakan Hugging Face Inference API untuk question generation"""
-    if not HF_API_TOKEN:
-        logger.warning("No HF_TOKEN available for question generation")
-        return None
-        
     headers = {
-        "Authorization": f"Bearer {HF_API_TOKEN}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {HF_API_TOKEN}" if HF_API_TOKEN else None
     }
     
+    # Format input sesuai dengan model question generation
     payload = {
         "inputs": text,
         "parameters": {
-            "max_length": 100,
+            "max_length": 200,
             "num_return_sequences": num_questions,
             "do_sample": True,
             "temperature": 0.7
@@ -85,7 +66,7 @@ def generate_questions_with_api(text, num_questions=3):
     }
     
     try:
-        response = requests.post(HF_QUESTION_URL, headers=headers, json=payload, timeout=30)
+        response = requests.post(HF_QUESTION_URL, headers=headers, json=payload)
         
         if response.status_code == 200:
             result = response.json()
@@ -94,77 +75,95 @@ def generate_questions_with_api(text, num_questions=3):
             if isinstance(result, list):
                 for item in result:
                     if isinstance(item, dict) and 'generated_text' in item:
-                        q = item['generated_text'].strip()
-                        if q and q.endswith('?') and len(q) > 10:
-                            questions.append(q)
+                        questions.append(item['generated_text'].strip())
                     elif isinstance(item, str):
-                        q = item.strip()
-                        if q and q.endswith('?') and len(q) > 10:
-                            questions.append(q)
+                        questions.append(item.strip())
             elif isinstance(result, dict) and 'generated_text' in result:
-                q = result['generated_text'].strip()
-                if q and q.endswith('?') and len(q) > 10:
-                    questions = [q]
+                questions = [result['generated_text'].strip()]
+            elif isinstance(result, str):
+                # Jika response berupa string, split berdasarkan pattern
+                questions = parse_questions_from_text(result)
             
-            # Remove duplicates and limit
-            seen = set()
-            unique_questions = []
-            for q in questions:
-                if q not in seen:
-                    unique_questions.append(q)
-                    seen.add(q)
-            
-            return unique_questions[:num_questions]
-            
-        elif response.status_code == 503:
-            # Model loading, retry once after delay
-            logger.info("Question model loading, retrying in 10 seconds...")
-            time.sleep(10)
-            response = requests.post(HF_QUESTION_URL, headers=headers, json=payload, timeout=30)
-            if response.status_code == 200:
-                result = response.json()
-                questions = []
-                
-                if isinstance(result, list):
-                    for item in result:
-                        if isinstance(item, dict) and 'generated_text' in item:
-                            q = item['generated_text'].strip()
-                            if q and q.endswith('?') and len(q) > 10:
-                                questions.append(q)
-                
-                # Remove duplicates and limit
-                seen = set()
-                unique_questions = []
-                for q in questions:
-                    if q not in seen:
-                        unique_questions.append(q)
-                        seen.add(q)
-                
-                return unique_questions[:num_questions]
-        
-        logger.error(f"Question API Error: {response.status_code} - {response.text}")
-        return None
+            # Clean up questions - remove duplicates dan format
+            questions = clean_questions(questions)
+            return questions[:num_questions]  # Limit sesuai request
+        else:
+            logger.error(f"Question API Error: {response.status_code} - {response.text}")
+            return None
             
     except Exception as e:
         logger.error(f"Question request error: {e}")
         return None
 
-def simple_fallback_summary(text, max_sentences=3):
-    """Simple fallback summary - only used when API completely fails"""
-    sentences = [s.strip() + '.' for s in text.split('.') if s.strip()]
+def parse_questions_from_text(text):
+    """Parse questions dari text response"""
+    # Split berdasarkan pattern question (ends with ?)
+    questions = re.split(r'[.!](?=\s*[A-Z])', text)
+    
+    # Filter hanya yang berupa pertanyaan (ends with ?)
+    questions = [q.strip() for q in questions if q.strip().endswith('?')]
+    
+    return questions
+
+def clean_questions(questions):
+    """Bersihkan dan format questions"""
+    cleaned = []
+    seen = set()
+    
+    for q in questions:
+        q = q.strip()
+        if q and q.endswith('?') and q not in seen and len(q) > 10:
+            # Capitalize first letter
+            q = q[0].upper() + q[1:] if len(q) > 1 else q.upper()
+            cleaned.append(q)
+            seen.add(q)
+    
+    return cleaned
+
+def simple_summarize(text, max_sentences=3):
+    """Fallback: simple sentence-based summarization"""
+    sentences = text.split('. ')
     if len(sentences) <= max_sentences:
         return text
     
-    # Take first, middle, and last sentences
+    # Ambil kalimat pertama, tengah, dan akhir
     selected = []
-    if sentences:
-        selected.append(sentences[0])
+    if len(sentences) > 0:
+        selected.append(sentences[0])  # Kalimat pertama
     if len(sentences) > 2:
-        selected.append(sentences[len(sentences)//2])
+        mid = len(sentences) // 2
+        selected.append(sentences[mid])  # Kalimat tengah
     if len(sentences) > 1:
-        selected.append(sentences[-1])
+        selected.append(sentences[-1] if sentences[-1] else sentences[-2])  # Kalimat akhir
     
-    return ' '.join(selected)
+    return '. '.join(selected) + '.'
+
+def simple_question_generation(text, num_questions=3):
+    """Fallback: simple question generation based on text analysis"""
+    sentences = text.split('. ')
+    questions = []
+    
+    # Generate questions based on common patterns
+    question_templates = [
+        "Apa yang dimaksud dengan {}?",
+        "Bagaimana cara {}?",
+        "Mengapa {}?",
+        "Kapan {}?",
+        "Di mana {}?"
+    ]
+    
+    # Extract key phrases (simplified)
+    words = text.lower().split()
+    common_words = {'adalah', 'dengan', 'yang', 'untuk', 'dalam', 'pada', 'akan', 'dapat', 'atau', 'dan', 'ini', 'itu'}
+    key_words = [w for w in words if len(w) > 3 and w not in common_words]
+    
+    # Generate simple questions
+    if key_words:
+        for i, template in enumerate(question_templates[:num_questions]):
+            if i < len(key_words):
+                questions.append(template.format(key_words[i]))
+    
+    return questions[:num_questions]
 
 @app.route('/', methods=['GET'])
 def home():
@@ -172,18 +171,18 @@ def home():
     return jsonify({
         "message": "Enhanced Text Processing API",
         "status": "running",
-        "features": ["Dual Model Processing", "Text Summarization", "Question Generation"],
+        "features": ["Text Summarization", "Question Generation", "Dual Model Processing"],
         "models": {
             "summarization": "fransiskaarthaa/text-summarize",
             "question_generation": "meilanikizana/question-generation-indonesia"
         },
-        "endpoints": ["/summarize"],
-        "api_status": "ready" if HF_API_TOKEN else "limited (no token)"
+        "endpoints": ["/summarize", "/generate-questions", "/process-text"],
+        "storage_usage": "Minimal - no local models"
     })
 
 @app.route('/summarize', methods=['POST'])
 def summarize():
-    """Main endpoint - handles both summarization and question generation"""
+    """Endpoint untuk summarization saja"""
     try:
         data = request.get_json()
         
@@ -195,7 +194,110 @@ def summarize():
             return jsonify({"error": "Text cannot be empty"}), 400
         
         if len(text) < 50:
-            return jsonify({"error": "Text too short for processing (minimum 50 characters)"}), 400
+            return jsonify({"error": "Text too short for summarization"}), 400
+            
+        # Determine max_length based on requested length
+        length_mapping = {
+            "short": 100,
+            "medium": 150,
+            "long": 200
+        }
+        
+        length = data.get('length', 'medium')
+        max_length = length_mapping.get(length, 150)
+        use_api = data.get('use_api', True)
+        
+        summary = None
+        method_used = ""
+        
+        # Try HuggingFace API first
+        if use_api:
+            summary = summarize_with_api(text, max_length)
+            method_used = "HuggingFace API"
+        
+        # Fallback to simple method
+        if not summary:
+            summary = simple_summarize(text)
+            method_used = "Simple fallback"
+        
+        if summary:
+            return jsonify({
+                "summary": summary,
+                "method": method_used,
+                "original_length": len(text),
+                "summary_length": len(summary),
+                "compression_ratio": f"{len(summary)/len(text)*100:.1f}%",
+                "status": "success"
+            })
+        else:
+            return jsonify({"error": "Failed to summarize"}), 500
+            
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        return jsonify({"error": "Server error occurred"}), 500
+
+@app.route('/generate-questions', methods=['POST'])
+def generate_questions():
+    """Endpoint untuk question generation saja"""
+    try:
+        data = request.get_json()
+        
+        if not data or 'text' not in data:
+            return jsonify({"error": "Field 'text' required"}), 400
+        
+        text = data['text'].strip()
+        if not text:
+            return jsonify({"error": "Text cannot be empty"}), 400
+        
+        if len(text) < 30:
+            return jsonify({"error": "Text too short for question generation"}), 400
+            
+        num_questions = min(data.get('num_questions', 3), 10)  # Limit max 10
+        use_api = data.get('use_api', True)
+        
+        questions = None
+        method_used = ""
+        
+        # Try HuggingFace API first
+        if use_api:
+            questions = generate_questions_with_api(text, num_questions)
+            method_used = "HuggingFace API"
+        
+        # Fallback to simple method
+        if not questions:
+            questions = simple_question_generation(text, num_questions)
+            method_used = "Simple fallback"
+        
+        if questions:
+            return jsonify({
+                "questions": questions,
+                "method": method_used,
+                "question_count": len(questions),
+                "text_length": len(text),
+                "status": "success"
+            })
+        else:
+            return jsonify({"error": "Failed to generate questions"}), 500
+            
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        return jsonify({"error": "Server error occurred"}), 500
+
+@app.route('/process-text', methods=['POST'])
+def process_text():
+    """Endpoint untuk dual processing (summary + questions)"""
+    try:
+        data = request.get_json()
+        
+        if not data or 'text' not in data:
+            return jsonify({"error": "Field 'text' required"}), 400
+        
+        text = data['text'].strip()
+        if not text:
+            return jsonify({"error": "Text cannot be empty"}), 400
+        
+        if len(text) < 50:
+            return jsonify({"error": "Text too short for processing"}), 400
             
         # Parameters
         length_mapping = {
@@ -206,82 +308,94 @@ def summarize():
         
         length = data.get('length', 'medium')
         max_length = length_mapping.get(length, 150)
+        num_questions = min(data.get('num_questions', 3), 10)
+        use_api = data.get('use_api', True)
         include_questions = data.get('include_questions', True)
-        num_questions = min(data.get('num_questions', 3), 5)  # Limit to 5 max
+        processing_mode = data.get('mode', 'parallel')  # 'parallel' or 'sequential'
         
         summary = None
         questions = []
-        processing_method = {}
+        methods_used = {}
         
-        if include_questions:
-            # Parallel processing for both summary and questions
-            logger.info("Starting parallel processing...")
-            
+        if processing_mode == 'parallel':
+            # Parallel processing using ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=2) as executor:
-                # Submit both tasks simultaneously
-                future_summary = executor.submit(summarize_with_api, text, max_length)
-                future_questions = executor.submit(generate_questions_with_api, text, num_questions)
+                # Submit both tasks
+                future_summary = executor.submit(summarize_with_api, text, max_length) if use_api else None
+                future_questions = executor.submit(generate_questions_with_api, text, num_questions) if (use_api and include_questions) else None
                 
-                # Get results with timeout
-                try:
-                    summary = future_summary.result(timeout=45)
-                    processing_method['summary'] = "HuggingFace API" if summary else "Failed"
-                except Exception as e:
-                    logger.error(f"Summary task failed: {e}")
-                    processing_method['summary'] = "Failed"
+                # Get results
+                if future_summary:
+                    try:
+                        summary = future_summary.result(timeout=30)  # 30 second timeout
+                        methods_used['summary'] = "HuggingFace API"
+                    except Exception as e:
+                        logger.error(f"Summary API failed: {e}")
+                        summary = None
                 
-                try:
-                    questions = future_questions.result(timeout=45)
-                    processing_method['questions'] = "HuggingFace API" if questions else "Failed"
-                except Exception as e:
-                    logger.error(f"Questions task failed: {e}")
-                    processing_method['questions'] = "Failed"
-        else:
-            # Only summarization
-            summary = summarize_with_api(text, max_length)
-            processing_method['summary'] = "HuggingFace API" if summary else "Failed"
+                if future_questions:
+                    try:
+                        questions = future_questions.result(timeout=30)  # 30 second timeout
+                        methods_used['questions'] = "HuggingFace API"
+                    except Exception as e:
+                        logger.error(f"Questions API failed: {e}")
+                        questions = None
         
-        # Fallback for summary only if API completely fails
+        else:  # Sequential processing
+            # Get summary first
+            if use_api:
+                summary = summarize_with_api(text, max_length)
+                methods_used['summary'] = "HuggingFace API" if summary else None
+            
+            # Then generate questions (could be based on summary or original text)
+            if include_questions and use_api:
+                input_for_questions = summary if summary else text  # Use summary if available
+                questions = generate_questions_with_api(input_for_questions, num_questions)
+                methods_used['questions'] = "HuggingFace API" if questions else None
+        
+        # Fallbacks
         if not summary:
-            logger.warning("Using fallback summary method")
-            summary = simple_fallback_summary(text)
-            processing_method['summary'] = "Simple fallback"
+            summary = simple_summarize(text)
+            methods_used['summary'] = "Simple fallback"
         
-        # Ensure we have valid questions array
         if include_questions and not questions:
-            questions = []
-            processing_method['questions'] = "No questions generated"
+            questions = simple_question_generation(text, num_questions)
+            methods_used['questions'] = "Simple fallback"
         
-        # Prepare response in format expected by ai.ts
+        # Prepare response
         response = {
+            "original_text": text,
             "summary": summary,
-            "questions": questions if include_questions else [],
-            "method": processing_method.get('summary', 'Unknown'),
-            "question_method": processing_method.get('questions', 'Not requested') if include_questions else 'Not requested',
             "original_length": len(text),
             "summary_length": len(summary) if summary else 0,
             "compression_ratio": f"{len(summary)/len(text)*100:.1f}%" if summary else "0%",
-            "question_count": len(questions) if include_questions else 0,
+            "methods_used": methods_used,
+            "processing_mode": processing_mode,
             "status": "success"
         }
         
-        logger.info(f"Processing completed: Summary={bool(summary)}, Questions={len(questions) if questions else 0}")
+        if include_questions:
+            response.update({
+                "questions": questions,
+                "question_count": len(questions) if questions else 0
+            })
+        
         return jsonify(response)
         
     except Exception as e:
-        logger.error(f"Error in summarize endpoint: {e}")
-        return jsonify({
-            "error": "Internal server error",
-            "details": str(e)
-        }), 500
+        logger.error(f"Error in process_text: {e}")
+        return jsonify({"error": "Server error occurred"}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check"""
+    """Health check untuk monitoring"""
     return jsonify({
-        "status": "healthy",
-        "api_token_available": bool(HF_API_TOKEN),
-        "models_status": "ready" if HF_API_TOKEN else "limited"
+        "status": "healthy", 
+        "storage": "minimal",
+        "models_available": {
+            "summarization": bool(HF_API_TOKEN),
+            "question_generation": bool(HF_API_TOKEN)
+        }
     })
 
 if __name__ == "__main__":
@@ -289,15 +403,21 @@ if __name__ == "__main__":
     
     print("🚀 Starting Enhanced Text Processing API")
     print(f"📡 Port: {port}")
+    print("💾 Storage usage: MINIMAL (no local models)")
     print("🤖 Models:")
     print("   📝 Summarization: fransiskaarthaa/text-summarize")
     print("   ❓ Questions: meilanikizana/question-generation-indonesia")
-    print("🔗 Main Endpoint: POST /summarize")
+    print("🔗 Endpoints:")
+    print("   GET  / - Status & Info")
+    print("   POST /summarize - Text summarization only") 
+    print("   POST /generate-questions - Question generation only")
+    print("   POST /process-text - Dual processing (summary + questions)")
+    print("   GET  /health - Health check")
     
     if not HF_API_TOKEN:
-        print("⚠️  Warning: No HF_TOKEN set. Limited functionality available.")
-        print("   Add HF_TOKEN environment variable for full API access")
+        print("⚠️  Warning: No HF_TOKEN set. API methods will use fallbacks.")
+        print("   Add HF_TOKEN in environment variables for full functionality")
     else:
-        print("✅ HF_TOKEN configured - Full API functionality available")
+        print("✅ HF_TOKEN configured - API methods available")
     
     app.run(host='0.0.0.0', port=port, debug=False)
