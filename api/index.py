@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Hugging Face API Configuration
-HF_API_TOKEN = os.environ.get('HF_TOKEN')
+HF_API_TOKEN = os.environ.get('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')
 HF_SUMMARY_URL = "https://api-inference.huggingface.co/models/fransiskaarthaa/text-summarize"
 HF_QUESTION_URL = "https://api-inference.huggingface.co/models/meilanikizana/indonesia-question-generation-model"
 
