@@ -14,13 +14,14 @@ app = Flask(__name__)
 
 # Hugging Face API Configuration
 HF_API_TOKEN = os.environ.get('HF_TOKEN')  # Set di Replit Secrets
-HF_SUMMARY_URL = "fransiskaarthaa/text-summarize"
-HF_QUESTION_URL = "meilanikizana/question-generation-indonesia"
+HF_SUMMARY_URL = "https://api-inference.huggingface.co/models/fransiskaarthaa/text-summarize"
+HF_QUESTION_URL = "https://api-inference.huggingface.co/models/meilanikizana/question-generation-indonesia"
 
 def summarize_with_api(text, max_length=150):
     """Gunakan Hugging Face Inference API untuk summarization"""
     headers = {
-        "Authorization": f"Bearer {HF_API_TOKEN}" if HF_API_TOKEN else None
+        "Authorization": f"Bearer {HF_API_TOKEN}",
+        "Content-Type": "application/json"
     }
     
     payload = {
@@ -51,42 +52,51 @@ def summarize_with_api(text, max_length=150):
 def generate_questions_with_api(text, num_questions=3):
     """Gunakan Hugging Face Inference API untuk question generation"""
     headers = {
-        "Authorization": f"Bearer {HF_API_TOKEN}" if HF_API_TOKEN else None
+        "Authorization": f"Bearer {HF_API_TOKEN}",
+        "Content-Type": "application/json"
     }
     
-    # Format input sesuai dengan model question generation
+    # Bersihkan dan format input text
+    cleaned_text = clean_input_text(text)
+    
     payload = {
-        "inputs": text,
+        "inputs": cleaned_text,
         "parameters": {
-            "max_length": 200,
-            "num_return_sequences": num_questions,
+            "max_length": 100,
+            "min_length": 10,
+            "num_return_sequences": min(num_questions, 5),  # Limit untuk menghindari timeout
             "do_sample": True,
-            "temperature": 0.7
+            "temperature": 0.8,
+            "top_p": 0.9,
+            "repetition_penalty": 1.2
         }
     }
     
     try:
-        response = requests.post(HF_QUESTION_URL, headers=headers, json=payload)
+        response = requests.post(HF_QUESTION_URL, headers=headers, json=payload, timeout=30)
         
         if response.status_code == 200:
             result = response.json()
-            questions = []
+            questions = extract_questions_from_result(result)
             
-            if isinstance(result, list):
-                for item in result:
-                    if isinstance(item, dict) and 'generated_text' in item:
-                        questions.append(item['generated_text'].strip())
-                    elif isinstance(item, str):
-                        questions.append(item.strip())
-            elif isinstance(result, dict) and 'generated_text' in result:
-                questions = [result['generated_text'].strip()]
-            elif isinstance(result, str):
-                # Jika response berupa string, split berdasarkan pattern
-                questions = parse_questions_from_text(result)
+            # Clean dan filter questions
+            cleaned_questions = clean_and_filter_questions(questions)
             
-            # Clean up questions - remove duplicates dan format
-            questions = clean_questions(questions)
-            return questions[:num_questions]  # Limit sesuai request
+            # Jika tidak mendapat cukup pertanyaan, coba dengan input yang lebih pendek
+            if len(cleaned_questions) < num_questions and len(cleaned_text) > 200:
+                # Coba dengan text yang dipotong
+                short_text = cleaned_text[:200] + "..."
+                return generate_questions_with_api(short_text, num_questions)
+            
+            return cleaned_questions[:num_questions]
+        
+        elif response.status_code == 503:
+            logger.warning("Model is loading, will retry...")
+            # Model sedang loading, bisa dicoba lagi setelah beberapa detik
+            import time
+            time.sleep(5)
+            # Recursive call dengan fallback ke simple method jika masih gagal
+            return None
         else:
             logger.error(f"Question API Error: {response.status_code} - {response.text}")
             return None
@@ -95,30 +105,173 @@ def generate_questions_with_api(text, num_questions=3):
         logger.error(f"Question request error: {e}")
         return None
 
-def parse_questions_from_text(text):
-    """Parse questions dari text response"""
-    # Split berdasarkan pattern question (ends with ?)
-    questions = re.split(r'[.!](?=\s*[A-Z])', text)
+def clean_input_text(text):
+    """Bersihkan input text untuk model"""
+    # Remove extra whitespace and newlines
+    text = re.sub(r'\s+', ' ', text.strip())
     
-    # Filter hanya yang berupa pertanyaan (ends with ?)
-    questions = [q.strip() for q in questions if q.strip().endswith('?')]
+    # Batasi panjang text untuk menghindari timeout
+    if len(text) > 500:
+        # Ambil 500 karakter pertama dan pastikan berakhir di kalimat
+        truncated = text[:500]
+        last_period = truncated.rfind('.')
+        if last_period > 200:  # Pastikan masih ada konten yang cukup
+            text = truncated[:last_period + 1]
+        else:
+            text = truncated + "."
+    
+    return text
+
+def extract_questions_from_result(result):
+    """Extract questions dari berbagai format response"""
+    questions = []
+    
+    try:
+        if isinstance(result, list):
+            for item in result:
+                if isinstance(item, dict):
+                    # Cek berbagai kemungkinan key
+                    for key in ['generated_text', 'question', 'output', 'text']:
+                        if key in item and item[key]:
+                            questions.extend(parse_questions_from_text(item[key]))
+                elif isinstance(item, str):
+                    questions.extend(parse_questions_from_text(item))
+        
+        elif isinstance(result, dict):
+            # Cek berbagai kemungkinan key
+            for key in ['generated_text', 'question', 'output', 'text']:
+                if key in result and result[key]:
+                    if isinstance(result[key], list):
+                        for q in result[key]:
+                            questions.extend(parse_questions_from_text(str(q)))
+                    else:
+                        questions.extend(parse_questions_from_text(result[key]))
+                        
+        elif isinstance(result, str):
+            questions.extend(parse_questions_from_text(result))
+            
+    except Exception as e:
+        logger.error(f"Error extracting questions: {e}")
     
     return questions
 
-def clean_questions(questions):
-    """Bersihkan dan format questions"""
+def parse_questions_from_text(text):
+    """Parse questions dari text dengan berbagai delimiter"""
+    if not text or not isinstance(text, str):
+        return []
+    
+    questions = []
+    
+    # Method 1: Split by question mark
+    potential_questions = re.split(r'\?+', text)
+    for q in potential_questions:
+        q = q.strip()
+        if q and len(q) > 5:  # Filter yang terlalu pendek
+            # Tambahkan tanda tanya kembali
+            q = q + '?'
+            questions.append(q)
+    
+    # Method 2: Find sentences ending with question mark
+    question_pattern = r'[^.!?]*\?+'
+    found_questions = re.findall(question_pattern, text)
+    for q in found_questions:
+        q = q.strip()
+        if q and len(q) > 5:
+            questions.append(q)
+    
+    # Method 3: Split by common delimiters and check for question words
+    delimiters = ['\n', '|', ';', '.', '!']
+    for delimiter in delimiters:
+        if delimiter in text:
+            parts = text.split(delimiter)
+            for part in parts:
+                part = part.strip()
+                if part and (part.endswith('?') or contains_question_words(part)):
+                    if not part.endswith('?'):
+                        part += '?'
+                    questions.append(part)
+    
+    return questions
+
+def contains_question_words(text):
+    """Check if text contains Indonesian question words"""
+    question_words = [
+        'apa', 'siapa', 'dimana', 'kapan', 'mengapa', 'bagaimana', 
+        'berapa', 'mana', 'kenapa', 'gimana', 'apakah', 'adakah'
+    ]
+    text_lower = text.lower()
+    return any(word in text_lower for word in question_words)
+
+def clean_and_filter_questions(questions):
+    """Bersihkan dan filter questions yang berkualitas"""
     cleaned = []
     seen = set()
     
     for q in questions:
+        if not q or not isinstance(q, str):
+            continue
+            
+        # Basic cleaning
         q = q.strip()
-        if q and q.endswith('?') and q not in seen and len(q) > 10:
-            # Capitalize first letter
+        q = re.sub(r'\s+', ' ', q)  # Normalize whitespace
+        
+        # Skip if too short or too long
+        if len(q) < 10 or len(q) > 200:
+            continue
+        
+        # Ensure it ends with question mark
+        if not q.endswith('?'):
+            q += '?'
+        
+        # Capitalize first letter
+        if q:
             q = q[0].upper() + q[1:] if len(q) > 1 else q.upper()
-            cleaned.append(q)
-            seen.add(q)
+        
+        # Skip duplicates (case insensitive)
+        q_lower = q.lower()
+        if q_lower in seen:
+            continue
+        
+        # Skip if doesn't look like a proper question
+        if not is_valid_question(q):
+            continue
+        
+        cleaned.append(q)
+        seen.add(q_lower)
     
     return cleaned
+
+def is_valid_question(question):
+    """Validate if the text is a proper question"""
+    # Must end with question mark
+    if not question.endswith('?'):
+        return False
+    
+    # Should contain at least one question word or be interrogative
+    question_lower = question.lower()
+    
+    question_indicators = [
+        'apa', 'siapa', 'dimana', 'kapan', 'mengapa', 'bagaimana', 
+        'berapa', 'mana', 'kenapa', 'gimana', 'apakah', 'adakah',
+        'bisakah', 'dapatkah', 'haruskah', 'akankah'
+    ]
+    
+    # Check for question words
+    has_question_word = any(word in question_lower for word in question_indicators)
+    
+    # Check for interrogative structure (starts with question word)
+    starts_with_question = any(question_lower.startswith(word) for word in question_indicators)
+    
+    # Check if it's not just a statement with question mark
+    if not has_question_word and not starts_with_question:
+        return False
+    
+    # Should have reasonable length and structure
+    words = question.split()
+    if len(words) < 3:  # Too short
+        return False
+    
+    return True
 
 def simple_summarize(text, max_sentences=3):
     """Fallback: simple sentence-based summarization"""
@@ -138,30 +291,46 @@ def simple_summarize(text, max_sentences=3):
     
     return '. '.join(selected) + '.'
 
-def simple_question_generation(text, num_questions=3):
-    """Fallback: simple question generation based on text analysis"""
+def fallback_question_generation(text, num_questions=3):
+    """Improved fallback question generation berdasarkan analisis teks"""
     sentences = text.split('. ')
     questions = []
     
-    # Generate questions based on common patterns
-    question_templates = [
-        "Apa yang dimaksud dengan {}?",
-        "Bagaimana cara {}?",
-        "Mengapa {}?",
-        "Kapan {}?",
-        "Di mana {}?"
-    ]
-    
-    # Extract key phrases (simplified)
+    # Analisis kata kunci dari teks
     words = text.lower().split()
-    common_words = {'adalah', 'dengan', 'yang', 'untuk', 'dalam', 'pada', 'akan', 'dapat', 'atau', 'dan', 'ini', 'itu'}
-    key_words = [w for w in words if len(w) > 3 and w not in common_words]
+    stop_words = {
+        'adalah', 'dengan', 'yang', 'untuk', 'dalam', 'pada', 'akan', 'dapat', 
+        'atau', 'dan', 'ini', 'itu', 'dari', 'ke', 'di', 'oleh', 'karena',
+        'sehingga', 'tetapi', 'namun', 'juga', 'jika', 'bila', 'ketika'
+    }
     
-    # Generate simple questions
-    if key_words:
-        for i, template in enumerate(question_templates[:num_questions]):
-            if i < len(key_words):
-                questions.append(template.format(key_words[i]))
+    # Extract key entities and concepts
+    key_phrases = []
+    for sentence in sentences[:3]:  # Fokus pada 3 kalimat pertama
+        sentence_words = sentence.lower().split()
+        meaningful_words = [w for w in sentence_words if len(w) > 3 and w not in stop_words]
+        if meaningful_words:
+            key_phrases.extend(meaningful_words[:2])  # Ambil 2 kata penting per kalimat
+    
+    # Generate contextual questions
+    if key_phrases:
+        # Pertanyaan berdasarkan konsep utama
+        if len(key_phrases) > 0:
+            questions.append(f"Apa yang dimaksud dengan {key_phrases[0]} dalam konteks ini?")
+        
+        if len(key_phrases) > 1:
+            questions.append(f"Bagaimana hubungan antara {key_phrases[0]} dan {key_phrases[1]}?")
+        
+        if len(sentences) > 1:
+            questions.append("Apa kesimpulan utama yang dapat diambil dari teks ini?")
+    
+    # Fallback questions jika tidak ada key phrases
+    if not questions:
+        questions = [
+            "Apa tema utama yang dibahas dalam teks ini?",
+            "Bagaimana penjelasan dari topik yang dibahas?",
+            "Apa yang dapat dipelajari dari informasi ini?"
+        ]
     
     return questions[:num_questions]
 
@@ -177,7 +346,12 @@ def home():
             "question_generation": "meilanikizana/question-generation-indonesia"
         },
         "endpoints": ["/summarize", "/generate-questions", "/process-text"],
-        "storage_usage": "Minimal - no local models"
+        "improvements": [
+            "Direct model-based question generation",
+            "Intelligent question parsing and validation",
+            "Improved fallback mechanisms",
+            "Better text preprocessing"
+        ]
     })
 
 @app.route('/summarize', methods=['POST'])
@@ -211,7 +385,7 @@ def summarize():
         method_used = ""
         
         # Try HuggingFace API first
-        if use_api:
+        if use_api and HF_API_TOKEN:
             summary = summarize_with_api(text, max_length)
             method_used = "HuggingFace API"
         
@@ -259,14 +433,14 @@ def generate_questions():
         method_used = ""
         
         # Try HuggingFace API first
-        if use_api:
+        if use_api and HF_API_TOKEN:
             questions = generate_questions_with_api(text, num_questions)
-            method_used = "HuggingFace API"
+            method_used = "HuggingFace API (Direct Model Generation)"
         
-        # Fallback to simple method
-        if not questions:
-            questions = simple_question_generation(text, num_questions)
-            method_used = "Simple fallback"
+        # Fallback to improved simple method
+        if not questions or len(questions) == 0:
+            questions = fallback_question_generation(text, num_questions)
+            method_used = "Improved contextual fallback"
         
         if questions:
             return jsonify({
@@ -317,7 +491,7 @@ def process_text():
         questions = []
         methods_used = {}
         
-        if processing_mode == 'parallel':
+        if processing_mode == 'parallel' and HF_API_TOKEN:
             # Parallel processing using ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=2) as executor:
                 # Submit both tasks
@@ -336,31 +510,30 @@ def process_text():
                 if future_questions:
                     try:
                         questions = future_questions.result(timeout=30)  # 30 second timeout
-                        methods_used['questions'] = "HuggingFace API"
+                        methods_used['questions'] = "HuggingFace API (Direct Model)"
                     except Exception as e:
                         logger.error(f"Questions API failed: {e}")
                         questions = None
         
         else:  # Sequential processing
             # Get summary first
-            if use_api:
+            if use_api and HF_API_TOKEN:
                 summary = summarize_with_api(text, max_length)
                 methods_used['summary'] = "HuggingFace API" if summary else None
             
-            # Then generate questions (could be based on summary or original text)
-            if include_questions and use_api:
-                input_for_questions = summary if summary else text  # Use summary if available
-                questions = generate_questions_with_api(input_for_questions, num_questions)
-                methods_used['questions'] = "HuggingFace API" if questions else None
+            # Generate questions from original text (not summary)
+            if include_questions and use_api and HF_API_TOKEN:
+                questions = generate_questions_with_api(text, num_questions)
+                methods_used['questions'] = "HuggingFace API (Direct Model)" if questions else None
         
         # Fallbacks
         if not summary:
             summary = simple_summarize(text)
             methods_used['summary'] = "Simple fallback"
         
-        if include_questions and not questions:
-            questions = simple_question_generation(text, num_questions)
-            methods_used['questions'] = "Simple fallback"
+        if include_questions and (not questions or len(questions) == 0):
+            questions = fallback_question_generation(text, num_questions)
+            methods_used['questions'] = "Improved contextual fallback"
         
         # Prepare response
         response = {
@@ -391,33 +564,42 @@ def health():
     """Health check untuk monitoring"""
     return jsonify({
         "status": "healthy", 
-        "storage": "minimal",
         "models_available": {
             "summarization": bool(HF_API_TOKEN),
             "question_generation": bool(HF_API_TOKEN)
-        }
+        },
+        "improvements": [
+            "Direct model-based question generation",
+            "Intelligent question validation",
+            "Enhanced text preprocessing",
+            "Better error handling"
+        ]
     })
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
     
-    print("🚀 Starting Enhanced Text Processing API")
+    print("🚀 Starting Enhanced Text Processing API v2.0")
     print(f"📡 Port: {port}")
-    print("💾 Storage usage: MINIMAL (no local models)")
     print("🤖 Models:")
     print("   📝 Summarization: fransiskaarthaa/text-summarize")
-    print("   ❓ Questions: meilanikizana/question-generation-indonesia")
+    print("   ❓ Questions: meilanikizana/question-generation-indonesia (Direct Generation)")
     print("🔗 Endpoints:")
     print("   GET  / - Status & Info")
     print("   POST /summarize - Text summarization only") 
-    print("   POST /generate-questions - Question generation only")
+    print("   POST /generate-questions - Question generation (Direct from model)")
     print("   POST /process-text - Dual processing (summary + questions)")
     print("   GET  /health - Health check")
+    print("✨ Improvements:")
+    print("   🎯 Direct model-based question generation")
+    print("   🔍 Intelligent question parsing and validation")
+    print("   🧹 Better text preprocessing")
+    print("   🔧 Enhanced error handling")
     
     if not HF_API_TOKEN:
-        print("⚠️  Warning: No HF_TOKEN set. API methods will use fallbacks.")
+        print("⚠️  Warning: No HF_TOKEN set. Using improved fallback methods.")
         print("   Add HF_TOKEN in environment variables for full functionality")
     else:
-        print("✅ HF_TOKEN configured - API methods available")
+        print("✅ HF_TOKEN configured - Direct model generation available")
     
     app.run(host='0.0.0.0', port=port, debug=False)
