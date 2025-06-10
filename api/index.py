@@ -4,6 +4,7 @@ import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from gradio_client import Client
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -13,9 +14,11 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Hugging Face API Configuration
-HF_API_TOKEN = ('bearer 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')  # Set di Replit Secrets
+HF_API_TOKEN = os.environ.get('HF_API_TOKEN', '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')
 HF_SUMMARY_URL = "https://api-inference.huggingface.co/models/fransiskaarthaa/text-summarize-fix"
-HF_QUESTION_URL = "https://api-inference.huggingface.co/models/meilanikizana/question-generation-indonesia"
+
+# Gradio Spaces Configuration
+GRADIO_SPACE_URL = "meilanikizana/indonesian-question-generator"
 
 def summarize_with_api(text, max_length=150):
     """Gunakan Hugging Face Inference API untuk summarization"""
@@ -49,55 +52,79 @@ def summarize_with_api(text, max_length=150):
         logger.error(f"Summary request error: {e}")
         return None
 
-def generate_questions_with_api(text, num_questions=3):
-    """Gunakan Hugging Face Inference API untuk question generation"""
-    if not HF_API_TOKEN:
-        logger.error("HF_API_TOKEN not available")
-        return None
-    
-    headers = {
-        "Authorization": f"Bearer {HF_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    
-    # Bersihkan dan format input text
-    cleaned_text = clean_input_text(text)
-    
-    payload = {
-        "inputs": cleaned_text,
-        "parameters": {
-            "max_length": 100,
-            "min_length": 10,
-            "num_return_sequences": min(num_questions, 5),
-            "do_sample": True,
-            "temperature": 0.8,
-            "top_p": 0.9,
-            "repetition_penalty": 1.2
-        }
-    }
-    
+def generate_questions_with_gradio(text, num_questions=3):
+    """Gunakan Gradio Client untuk question generation dari Hugging Face Spaces"""
     try:
-        response = requests.post(HF_QUESTION_URL, headers=headers, json=payload, timeout=30)
+        # Bersihkan dan format input text
+        cleaned_text = clean_input_text(text)
         
-        if response.status_code == 200:
-            result = response.json()
-            questions = extract_questions_from_result(result)
-            
-            # Clean dan filter questions
-            cleaned_questions = clean_and_filter_questions(questions)
-            
-            return cleaned_questions[:num_questions] if cleaned_questions else None
+        logger.info(f"Connecting to Gradio Space: {GRADIO_SPACE_URL}")
         
-        elif response.status_code == 503:
-            logger.warning("Model is loading, please try again later")
-            return None
+        # Initialize Gradio Client
+        client = Client(GRADIO_SPACE_URL)
+        
+        # Call the predict function
+        result = client.predict(
+            context=cleaned_text,
+            num_questions=float(num_questions),
+            api_name="/predict"
+        )
+        
+        logger.info(f"Gradio API Response: {result}")
+        
+        # Parse the result - Gradio biasanya return string
+        if isinstance(result, str):
+            questions = parse_questions_from_gradio_result(result)
         else:
-            logger.error(f"Question API Error: {response.status_code} - {response.text}")
+            logger.error(f"Unexpected result type from Gradio: {type(result)}")
             return None
-            
+        
+        # Clean dan filter questions
+        cleaned_questions = clean_and_filter_questions(questions)
+        
+        return cleaned_questions[:num_questions] if cleaned_questions else None
+        
     except Exception as e:
-        logger.error(f"Question request error: {e}")
+        logger.error(f"Gradio Client error: {e}")
         return None
+
+def parse_questions_from_gradio_result(result_text):
+    """Parse questions dari hasil Gradio yang berupa string"""
+    if not result_text or not isinstance(result_text, str):
+        return []
+    
+    questions = []
+    
+    # Method 1: Split berdasarkan newline (biasanya Gradio return dengan newline)
+    lines = result_text.strip().split('\n')
+    for line in lines:
+        line = line.strip()
+        if line and len(line) > 5:
+            # Remove numbering jika ada (1. 2. 3. dll)
+            line = re.sub(r'^\d+\.?\s*', '', line)
+            
+            # Pastikan berakhir dengan tanda tanya
+            if not line.endswith('?'):
+                line += '?'
+            
+            questions.append(line)
+    
+    # Method 2: Jika tidak ada newline, coba split dengan delimiter lain
+    if len(questions) == 0:
+        # Coba split berdasarkan pola angka (1. 2. 3.)
+        parts = re.split(r'\d+\.?\s*', result_text)
+        for part in parts:
+            part = part.strip()
+            if part and len(part) > 5:
+                if not part.endswith('?'):
+                    part += '?'
+                questions.append(part)
+    
+    # Method 3: Fallback ke method parsing original
+    if len(questions) == 0:
+        questions = parse_questions_from_text(result_text)
+    
+    return questions
 
 def clean_input_text(text):
     """Bersihkan input text untuk model"""
@@ -115,39 +142,6 @@ def clean_input_text(text):
             text = truncated + "."
     
     return text
-
-def extract_questions_from_result(result):
-    """Extract questions dari berbagai format response"""
-    questions = []
-    
-    try:
-        if isinstance(result, list):
-            for item in result:
-                if isinstance(item, dict):
-                    # Cek berbagai kemungkinan key
-                    for key in ['generated_text', 'question', 'output', 'text']:
-                        if key in item and item[key]:
-                            questions.extend(parse_questions_from_text(item[key]))
-                elif isinstance(item, str):
-                    questions.extend(parse_questions_from_text(item))
-        
-        elif isinstance(result, dict):
-            # Cek berbagai kemungkinan key
-            for key in ['generated_text', 'question', 'output', 'text']:
-                if key in result and result[key]:
-                    if isinstance(result[key], list):
-                        for q in result[key]:
-                            questions.extend(parse_questions_from_text(str(q)))
-                    else:
-                        questions.extend(parse_questions_from_text(result[key]))
-                        
-        elif isinstance(result, str):
-            questions.extend(parse_questions_from_text(result))
-            
-    except Exception as e:
-        logger.error(f"Error extracting questions: {e}")
-    
-    return questions
 
 def parse_questions_from_text(text):
     """Parse questions dari text dengan berbagai delimiter"""
@@ -289,15 +283,15 @@ def simple_summarize(text, max_sentences=3):
 def home():
     """Status check"""
     return jsonify({
-        "message": "Pure HuggingFace Text Processing API",
+        "message": "HuggingFace + Gradio Spaces Text Processing API",
         "status": "running",
         "features": ["Text Summarization", "Question Generation"],
         "models": {
-            "summarization": "fransiskaarthaa/text-summarize-fix",
-            "question_generation": "meilanikizana/question-generation-indonesia"
+            "summarization": "fransiskaarthaa/text-summarize-fix (HF Inference API)",
+            "question_generation": "meilanikizana/indonesian-question-generator (Gradio Spaces)"
         },
         "endpoints": ["/summarize", "/generate-questions", "/process-text"],
-        "note": "Pure HuggingFace API only - no manual fallback questions"
+        "note": "Using HuggingFace Inference API for summarization and Gradio Spaces for question generation"
     })
 
 @app.route('/summarize', methods=['POST'])
@@ -334,7 +328,7 @@ def summarize():
         if summary:
             return jsonify({
                 "summary": summary,
-                "method": "HuggingFace API",
+                "method": "HuggingFace Inference API",
                 "original_length": len(text),
                 "summary_length": len(summary),
                 "compression_ratio": f"{len(summary)/len(text)*100:.1f}%",
@@ -349,10 +343,7 @@ def summarize():
 
 @app.route('/generate-questions', methods=['POST'])
 def generate_questions():
-    """Endpoint untuk question generation saja"""
-    if not HF_API_TOKEN:
-        return jsonify({"error": "HF_API_TOKEN not configured"}), 500
-    
+    """Endpoint untuk question generation menggunakan Gradio Spaces"""
     try:
         data = request.get_json()
         
@@ -368,18 +359,19 @@ def generate_questions():
             
         num_questions = min(data.get('num_questions', 3), 10)  # Limit max 10
         
-        questions = generate_questions_with_api(text, num_questions)
+        questions = generate_questions_with_gradio(text, num_questions)
         
         if questions and len(questions) > 0:
             return jsonify({
                 "questions": questions,
-                "method": "HuggingFace API",
+                "method": "Gradio Spaces",
+                "gradio_space": GRADIO_SPACE_URL,
                 "question_count": len(questions),
                 "text_length": len(text),
                 "status": "success"
             })
         else:
-            return jsonify({"error": "Failed to generate questions from HuggingFace API"}), 500
+            return jsonify({"error": "Failed to generate questions from Gradio Spaces"}), 500
             
     except Exception as e:
         logger.error(f"Error: {e}")
@@ -425,18 +417,18 @@ def process_text():
             with ThreadPoolExecutor(max_workers=2) as executor:
                 # Submit both tasks
                 future_summary = executor.submit(summarize_with_api, text, max_length)
-                future_questions = executor.submit(generate_questions_with_api, text, num_questions) if include_questions else None
+                future_questions = executor.submit(generate_questions_with_gradio, text, num_questions) if include_questions else None
                 
                 # Get results
                 try:
-                    summary = future_summary.result(timeout=45)  # 45 second timeout
+                    summary = future_summary.result(timeout=60)  # 60 second timeout for Gradio
                 except Exception as e:
                     logger.error(f"Summary API failed: {e}")
                     summary = None
                 
                 if future_questions:
                     try:
-                        questions = future_questions.result(timeout=45)  # 45 second timeout
+                        questions = future_questions.result(timeout=60)  # 60 second timeout for Gradio
                     except Exception as e:
                         logger.error(f"Questions API failed: {e}")
                         questions = None
@@ -447,14 +439,14 @@ def process_text():
             
             # Generate questions from original text
             if include_questions:
-                questions = generate_questions_with_api(text, num_questions)
+                questions = generate_questions_with_gradio(text, num_questions)
         
         # Check if we got results
         if not summary:
             return jsonify({"error": "Failed to generate summary from HuggingFace API"}), 500
         
         if include_questions and (not questions or len(questions) == 0):
-            return jsonify({"error": "Failed to generate questions from HuggingFace API"}), 500
+            return jsonify({"error": "Failed to generate questions from Gradio Spaces"}), 500
         
         # Prepare response
         response = {
@@ -463,7 +455,10 @@ def process_text():
             "original_length": len(text),
             "summary_length": len(summary),
             "compression_ratio": f"{len(summary)/len(text)*100:.1f}%",
-            "method": "HuggingFace API",
+            "method": {
+                "summarization": "HuggingFace Inference API",
+                "question_generation": "Gradio Spaces"
+            },
             "processing_mode": processing_mode,
             "status": "success"
         }
@@ -487,35 +482,40 @@ def health():
         "status": "healthy" if HF_API_TOKEN else "missing_token",
         "hf_token_configured": bool(HF_API_TOKEN),
         "models": {
-            "summarization": "fransiskaarthaa/text-summarize-fix",
-            "question_generation": "meilanikizana/question-generation-indonesia"
+            "summarization": "fransiskaarthaa/text-summarize-fix (HF Inference API)",
+            "question_generation": f"{GRADIO_SPACE_URL} (Gradio Spaces)"
         },
-        "note": "Pure HuggingFace API implementation"
+        "services": {
+            "huggingface_inference": "ready" if HF_API_TOKEN else "missing_token",
+            "gradio_spaces": "ready"
+        }
     })
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
     
-    print("🚀 Starting Pure HuggingFace Text Processing API")
+    print("🚀 Starting HuggingFace + Gradio Spaces Text Processing API")
     print(f"📡 Port: {port}")
     print("🤖 Models:")
-    print("   📝 Summarization: fransiskaarthaa/text-summarize-fix")
-    print("   ❓ Questions: meilanikizana/question-generation-indonesia")
+    print("   📝 Summarization: fransiskaarthaa/text-summarize-fix (HF Inference API)")
+    print(f"   ❓ Questions: {GRADIO_SPACE_URL} (Gradio Spaces)")
     print("🔗 Endpoints:")
     print("   GET  / - Status & Info")
-    print("   POST /summarize - Text summarization only") 
-    print("   POST /generate-questions - Question generation (HuggingFace only)")
+    print("   POST /summarize - Text summarization (HF Inference API)") 
+    print("   POST /generate-questions - Question generation (Gradio Spaces)")
     print("   POST /process-text - Dual processing (summary + questions)")
     print("   GET  /health - Health check")
     print("✨ Features:")
-    print("   🎯 Pure HuggingFace API implementation")
-    print("   🚫 No manual fallback questions")
+    print("   🎯 HuggingFace Inference API + Gradio Spaces")
     print("   🔧 Clean error handling")
+    print("   ⚡ Parallel processing support")
     
     if not HF_API_TOKEN:
-        print("❌ ERROR: HF_TOKEN not configured!")
-        print("   Please set HF_TOKEN environment variable to use the API")
+        print("❌ WARNING: HF_API_TOKEN not configured for summarization!")
+        print("   Summarization will not work without HF token")
     else:
-        print("✅ HF_TOKEN configured - Ready to use HuggingFace API")
+        print("✅ HF_API_TOKEN configured - Ready to use HuggingFace Inference API")
+    
+    print("✅ Gradio Spaces configured - Ready to use question generation")
     
     app.run(host='0.0.0.0', port=port, debug=False)
