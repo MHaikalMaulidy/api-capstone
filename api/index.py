@@ -52,41 +52,43 @@ def summarize_with_api(text, max_length=150):
         logger.error(f"Summary request error: {e}")
         return None
 
+import requests
+
 def generate_questions_with_gradio(text, num_questions=3):
-    """Gunakan Gradio Client untuk question generation dari Hugging Face Spaces"""
     try:
-        # Bersihkan dan format input text
         cleaned_text = clean_input_text(text)
-        
-        logger.info(f"Connecting to Gradio Space: {GRADIO_SPACE_URL}")
-        
-        # Initialize Gradio Client
-        client = Client(GRADIO_SPACE_URL)
-        
-        # Call the predict function
-        result = client.predict(
-            context=cleaned_text,
-            num_questions=float(num_questions),
-            api_name="/predict"
+        logger.info(f"Sending request to Gradio Space with context: {cleaned_text}")
+
+        payload = {
+            "data": [cleaned_text, float(num_questions)]
+        }
+
+        response = requests.post(
+            "https://meilanikizana-indonesian-question-generator.hf.space/run/predict",
+            json=payload,
+            timeout=60
         )
-        
-        logger.info(f"Gradio API Response: {result}")
-        
-        # Parse the result - Gradio biasanya return string
-        if isinstance(result, str):
-            questions = parse_questions_from_gradio_result(result)
+
+        if response.status_code == 200:
+            result = response.json()
+            # Result structure: {'data': ['string hasil']}
+            raw_text = result.get('data', [None])[0]
+
+            if isinstance(raw_text, str) and raw_text.strip():
+                logger.info(f"Gradio raw response: {raw_text}")
+                questions = parse_questions_from_gradio_result(raw_text)
+                return clean_and_filter_questions(questions)
+            else:
+                logger.error("Gradio result kosong atau bukan string")
+                return None
         else:
-            logger.error(f"Unexpected result type from Gradio: {type(result)}")
+            logger.error(f"Gradio HTTP Error {response.status_code}: {response.text}")
             return None
-        
-        # Clean dan filter questions
-        cleaned_questions = clean_and_filter_questions(questions)
-        
-        return cleaned_questions[:num_questions] if cleaned_questions else None
-        
+
     except Exception as e:
-        logger.error(f"Gradio Client error: {e}")
+        logger.exception("Gagal call Gradio via requests:")
         return None
+
 
 def parse_questions_from_gradio_result(result_text):
     """Parse questions dari hasil Gradio yang berupa string"""
