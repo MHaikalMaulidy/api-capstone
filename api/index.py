@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Hugging Face API Configuration
-HF_API_TOKEN = ('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')  # Set di Replit Secrets
+HF_API_TOKEN = ('bearer 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')  # Set di Replit Secrets
 HF_SUMMARY_URL = "https://api-inference.huggingface.co/models/fransiskaarthaa/text-summarize-fix"
 HF_QUESTION_URL = "https://api-inference.huggingface.co/models/meilanikizana/question-generation-indonesia"
 
