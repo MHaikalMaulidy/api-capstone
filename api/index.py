@@ -52,7 +52,7 @@ def summarize_with_api(text, max_length=150):
         logger.error(f"Summary request error: {e}")
         return None
 
-def generate_questions_with_gradio(text, num_questions=3):
+def generate_questions_with_gradio(text, num_questions=3, timeout=30):
     """Gunakan Gradio Client untuk question generation dari Hugging Face Spaces"""
     try:
         # Bersihkan dan format input text
@@ -62,15 +62,27 @@ def generate_questions_with_gradio(text, num_questions=3):
         logger.info(f"Input text: {cleaned_text[:100]}...")
         logger.info(f"Num questions: {num_questions}")
         
-        # Initialize Gradio Client dengan timeout yang lebih panjang
+        # Initialize Gradio Client dengan timeout yang lebih pendek
         client = Client(GRADIO_SPACE_URL)
         
-        # Call the predict function - pastikan parameter sesuai dengan API
-        result = client.predict(
-            context=cleaned_text,  # parameter pertama: context (str)
-            num_questions=int(num_questions),  # parameter kedua: num_questions (convert ke int, bukan float)
-            api_name="/predict"
-        )
+        # Call the predict function dengan timeout handling
+        import signal
+        
+        def timeout_handler(signum, frame):
+            raise TimeoutError("Gradio request timed out")
+        
+        # Set timeout alarm
+        signal.alarm(timeout)
+        
+        try:
+            result = client.predict(
+                context=cleaned_text,  # parameter pertama: context (str)
+                num_questions=int(num_questions),  # parameter kedua: num_questions (convert ke int, bukan float)
+                api_name="/predict"
+            )
+        finally:
+            # Cancel alarm
+            signal.alarm(0)
         
         logger.info(f"Raw Gradio API Response: {result}")
         logger.info(f"Response type: {type(result)}")
@@ -103,6 +115,9 @@ def generate_questions_with_gradio(text, num_questions=3):
             
         return cleaned_questions[:num_questions] if cleaned_questions else None
         
+    except TimeoutError:
+        logger.error(f"Gradio request timed out after {timeout} seconds")
+        return None
     except Exception as e:
         logger.error(f"Gradio Client error: {str(e)}")
         logger.error(f"Error type: {type(e)}")
@@ -111,22 +126,36 @@ def generate_questions_with_gradio(text, num_questions=3):
         return None
 
 def test_gradio_connection():
-    """Test koneksi ke Gradio Spaces"""
+    """Test koneksi ke Gradio Spaces dengan timeout pendek"""
     try:
         logger.info("Testing Gradio connection...")
         client = Client(GRADIO_SPACE_URL)
         
-        # Test dengan input sederhana
-        test_result = client.predict(
-            context="Indonesia adalah negara kepulauan yang indah.",
-            num_questions=1,
-            api_name="/predict"
-        )
+        # Set timeout untuk test
+        import signal
+        
+        def timeout_handler(signum, frame):
+            raise TimeoutError("Connection test timed out")
+        
+        signal.alarm(15)  # 15 detik timeout untuk test
+        
+        try:
+            # Test dengan input sederhana
+            test_result = client.predict(
+                context="Indonesia adalah negara kepulauan yang indah.",
+                num_questions=1,
+                api_name="/predict"
+            )
+        finally:
+            signal.alarm(0)
         
         logger.info(f"Test result: {test_result}")
         logger.info(f"Test result type: {type(test_result)}")
         return test_result is not None
         
+    except TimeoutError:
+        logger.error("Gradio connection test timed out")
+        return False
     except Exception as e:
         logger.error(f"Gradio connection test failed: {e}")
         return False
@@ -246,7 +275,52 @@ def clean_and_filter_questions(questions):
     
     return cleaned
 
-def is_valid_question_relaxed(question):
+def generate_questions_fallback(text, num_questions=3):
+    """Fallback method untuk generate questions tanpa Gradio"""
+    try:
+        logger.info("Using fallback question generation method")
+        
+        # Simple rule-based question generation
+        sentences = text.split('.')
+        questions = []
+        
+        # Template pertanyaan bahasa Indonesia
+        question_templates = [
+            "Apa yang dimaksud dengan {}?",
+            "Mengapa {} penting?",
+            "Bagaimana {} dapat dijelaskan?",
+            "Kapan {} terjadi?",
+            "Dimana {} dapat ditemukan?"
+        ]
+        
+        # Extract key terms (simple approach)
+        import re
+        words = re.findall(r'\b[A-Za-z]+\b', text.lower())
+        
+        # Filter common words
+        common_words = {'dan', 'atau', 'yang', 'untuk', 'dari', 'dengan', 'pada', 'di', 'ke', 'oleh', 'adalah', 'ini', 'itu', 'tersebut'}
+        key_terms = [word for word in words if len(word) > 3 and word not in common_words]
+        
+        # Generate questions
+        for i, template in enumerate(question_templates[:num_questions]):
+            if i < len(key_terms):
+                question = template.format(key_terms[i])
+                questions.append(question)
+        
+        # If we don't have enough questions, create generic ones
+        while len(questions) < num_questions:
+            if len(questions) == 0:
+                questions.append("Apa informasi penting dari teks ini?")
+            elif len(questions) == 1:
+                questions.append("Bagaimana hal ini dapat dijelaskan lebih lanjut?")
+            else:
+                questions.append("Mengapa topik ini menarik untuk dibahas?")
+        
+        return questions[:num_questions]
+        
+    except Exception as e:
+        logger.error(f"Fallback question generation failed: {e}")
+        return None
     """Validate if the text is a proper question (relaxed version)"""
     # Must end with question mark
     if not question.endswith('?'):
@@ -314,7 +388,7 @@ def test_gradio():
 
 @app.route('/generate-questions', methods=['POST'])
 def generate_questions():
-    """Endpoint untuk question generation menggunakan Gradio Spaces"""
+    """Endpoint untuk question generation menggunakan Gradio Spaces dengan fallback"""
     try:
         data = request.get_json()
         
@@ -329,29 +403,48 @@ def generate_questions():
             return jsonify({"error": "Text too short for question generation"}), 400
             
         num_questions = min(data.get('num_questions', 3), 10)  # Limit max 10
+        use_fallback = data.get('use_fallback', False)  # Allow forced fallback
         
         logger.info(f"Processing request - Text length: {len(text)}, Num questions: {num_questions}")
         
-        questions = generate_questions_with_gradio(text, num_questions)
+        questions = None
+        method_used = "unknown"
+        
+        # Try Gradio first (unless fallback is forced)
+        if not use_fallback:
+            try:
+                questions = generate_questions_with_gradio(text, num_questions, timeout=25)
+                method_used = "Gradio Spaces"
+            except Exception as e:
+                logger.warning(f"Gradio failed, trying fallback: {e}")
+                questions = None
+        
+        # Use fallback if Gradio failed or was skipped
+        if not questions or len(questions) == 0:
+            logger.info("Using fallback question generation")
+            questions = generate_questions_fallback(text, num_questions)
+            method_used = "Fallback (Rule-based)"
         
         if questions and len(questions) > 0:
             return jsonify({
                 "questions": questions,
-                "method": "Gradio Spaces",
-                "gradio_space": GRADIO_SPACE_URL,
+                "method": method_used,
+                "gradio_space": GRADIO_SPACE_URL if method_used == "Gradio Spaces" else None,
                 "question_count": len(questions),
                 "text_length": len(text),
-                "status": "success"
+                "status": "success",
+                "fallback_used": method_used != "Gradio Spaces"
             })
         else:
-            # Tambahkan informasi debug
+            # Complete failure
             return jsonify({
-                "error": "Failed to generate questions from Gradio Spaces",
+                "error": "Failed to generate questions with both Gradio and fallback methods",
                 "debug_info": {
                     "text_length": len(text),
                     "num_questions_requested": num_questions,
                     "gradio_space": GRADIO_SPACE_URL,
-                    "suggestion": "Try testing the /test-gradio endpoint first"
+                    "methods_tried": ["Gradio Spaces", "Fallback"],
+                    "suggestion": "The Gradio Space might be down or overloaded. Try again later or contact support."
                 }
             }), 500
             
