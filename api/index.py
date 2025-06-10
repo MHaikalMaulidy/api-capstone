@@ -52,64 +52,111 @@ def summarize_with_api(text, max_length=150):
         logger.error(f"Summary request error: {e}")
         return None
 
-import requests
-
 def generate_questions_with_gradio(text, num_questions=3):
+    """Gunakan Gradio Client untuk question generation dari Hugging Face Spaces"""
     try:
+        # Bersihkan dan format input text
         cleaned_text = clean_input_text(text)
-        logger.info(f"Sending request to Gradio Space with context: {cleaned_text}")
-
-        payload = {
-            "data": [cleaned_text, float(num_questions)]
-        }
-
-        response = requests.post(
-            "https://meilanikizana-indonesian-question-generator.hf.space/run/predict",
-            json=payload,
-            timeout=60
+        
+        logger.info(f"Connecting to Gradio Space: {GRADIO_SPACE_URL}")
+        logger.info(f"Input text: {cleaned_text[:100]}...")
+        logger.info(f"Num questions: {num_questions}")
+        
+        # Initialize Gradio Client dengan timeout yang lebih panjang
+        client = Client(GRADIO_SPACE_URL)
+        
+        # Call the predict function - pastikan parameter sesuai dengan API
+        result = client.predict(
+            context=cleaned_text,  # parameter pertama: context (str)
+            num_questions=int(num_questions),  # parameter kedua: num_questions (convert ke int, bukan float)
+            api_name="/predict"
         )
-
-        if response.status_code == 200:
-            result = response.json()
-            # Result structure: {'data': ['string hasil']}
-            raw_text = result.get('data', [None])[0]
-
-            if isinstance(raw_text, str) and raw_text.strip():
-                logger.info(f"Gradio raw response: {raw_text}")
-                questions = parse_questions_from_gradio_result(raw_text)
-                return clean_and_filter_questions(questions)
-            else:
-                logger.error("Gradio result kosong atau bukan string")
-                return None
-        else:
-            logger.error(f"Gradio HTTP Error {response.status_code}: {response.text}")
+        
+        logger.info(f"Raw Gradio API Response: {result}")
+        logger.info(f"Response type: {type(result)}")
+        
+        # Parse the result
+        if result is None:
+            logger.error("Gradio returned None result")
             return None
-
+            
+        if isinstance(result, str):
+            # Jika result adalah string kosong atau hanya whitespace
+            if not result.strip():
+                logger.error("Gradio returned empty string")
+                return None
+                
+            questions = parse_questions_from_gradio_result(result)
+            logger.info(f"Parsed questions: {questions}")
+        else:
+            logger.error(f"Unexpected result type from Gradio: {type(result)}")
+            logger.error(f"Result content: {result}")
+            return None
+        
+        # Clean dan filter questions
+        cleaned_questions = clean_and_filter_questions(questions)
+        logger.info(f"Cleaned questions: {cleaned_questions}")
+        
+        if not cleaned_questions:
+            logger.error("No valid questions after cleaning")
+            return None
+            
+        return cleaned_questions[:num_questions] if cleaned_questions else None
+        
     except Exception as e:
-        logger.exception("Gagal call Gradio via requests:")
+        logger.error(f"Gradio Client error: {str(e)}")
+        logger.error(f"Error type: {type(e)}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         return None
 
+def test_gradio_connection():
+    """Test koneksi ke Gradio Spaces"""
+    try:
+        logger.info("Testing Gradio connection...")
+        client = Client(GRADIO_SPACE_URL)
+        
+        # Test dengan input sederhana
+        test_result = client.predict(
+            context="Indonesia adalah negara kepulauan yang indah.",
+            num_questions=1,
+            api_name="/predict"
+        )
+        
+        logger.info(f"Test result: {test_result}")
+        logger.info(f"Test result type: {type(test_result)}")
+        return test_result is not None
+        
+    except Exception as e:
+        logger.error(f"Gradio connection test failed: {e}")
+        return False
 
 def parse_questions_from_gradio_result(result_text):
     """Parse questions dari hasil Gradio yang berupa string"""
     if not result_text or not isinstance(result_text, str):
+        logger.warning(f"Invalid result_text: {result_text}")
         return []
     
     questions = []
+    result_text = result_text.strip()
     
-    # Method 1: Split berdasarkan newline (biasanya Gradio return dengan newline)
-    lines = result_text.strip().split('\n')
+    logger.info(f"Parsing result text: {result_text}")
+    
+    # Method 1: Split berdasarkan newline
+    lines = result_text.split('\n')
     for line in lines:
         line = line.strip()
         if line and len(line) > 5:
             # Remove numbering jika ada (1. 2. 3. dll)
             line = re.sub(r'^\d+\.?\s*', '', line)
+            line = line.strip()
             
             # Pastikan berakhir dengan tanda tanya
-            if not line.endswith('?'):
+            if line and not line.endswith('?'):
                 line += '?'
             
-            questions.append(line)
+            if line:
+                questions.append(line)
     
     # Method 2: Jika tidak ada newline, coba split dengan delimiter lain
     if len(questions) == 0:
@@ -122,10 +169,13 @@ def parse_questions_from_gradio_result(result_text):
                     part += '?'
                 questions.append(part)
     
-    # Method 3: Fallback ke method parsing original
-    if len(questions) == 0:
-        questions = parse_questions_from_text(result_text)
+    # Method 3: Jika masih kosong, anggap seluruh text adalah satu pertanyaan
+    if len(questions) == 0 and result_text:
+        if not result_text.endswith('?'):
+            result_text += '?'
+        questions.append(result_text)
     
+    logger.info(f"Parsed {len(questions)} questions: {questions}")
     return questions
 
 def clean_input_text(text):
@@ -145,44 +195,6 @@ def clean_input_text(text):
     
     return text
 
-def parse_questions_from_text(text):
-    """Parse questions dari text dengan berbagai delimiter"""
-    if not text or not isinstance(text, str):
-        return []
-    
-    questions = []
-    
-    # Method 1: Split by question mark
-    potential_questions = re.split(r'\?+', text)
-    for q in potential_questions:
-        q = q.strip()
-        if q and len(q) > 5:  # Filter yang terlalu pendek
-            # Tambahkan tanda tanya kembali
-            q = q + '?'
-            questions.append(q)
-    
-    # Method 2: Find sentences ending with question mark
-    question_pattern = r'[^.!?]*\?+'
-    found_questions = re.findall(question_pattern, text)
-    for q in found_questions:
-        q = q.strip()
-        if q and len(q) > 5:
-            questions.append(q)
-    
-    # Method 3: Split by common delimiters and check for question words
-    delimiters = ['\n', '|', ';', '.', '!']
-    for delimiter in delimiters:
-        if delimiter in text:
-            parts = text.split(delimiter)
-            for part in parts:
-                part = part.strip()
-                if part and (part.endswith('?') or contains_question_words(part)):
-                    if not part.endswith('?'):
-                        part += '?'
-                    questions.append(part)
-    
-    return questions
-
 def contains_question_words(text):
     """Check if text contains Indonesian question words"""
     question_words = [
@@ -194,6 +206,9 @@ def contains_question_words(text):
 
 def clean_and_filter_questions(questions):
     """Bersihkan dan filter questions yang berkualitas"""
+    if not questions:
+        return []
+        
     cleaned = []
     seen = set()
     
@@ -206,7 +221,7 @@ def clean_and_filter_questions(questions):
         q = re.sub(r'\s+', ' ', q)  # Normalize whitespace
         
         # Skip if too short or too long
-        if len(q) < 10 or len(q) > 200:
+        if len(q) < 5 or len(q) > 200:  # Lowered minimum length
             continue
         
         # Ensure it ends with question mark
@@ -222,8 +237,8 @@ def clean_and_filter_questions(questions):
         if q_lower in seen:
             continue
         
-        # Skip if doesn't look like a proper question
-        if not is_valid_question(q):
+        # Less strict validation for Indonesian questions
+        if not is_valid_question_relaxed(q):
             continue
         
         cleaned.append(q)
@@ -231,13 +246,18 @@ def clean_and_filter_questions(questions):
     
     return cleaned
 
-def is_valid_question(question):
-    """Validate if the text is a proper question"""
+def is_valid_question_relaxed(question):
+    """Validate if the text is a proper question (relaxed version)"""
     # Must end with question mark
     if not question.endswith('?'):
         return False
     
-    # Should contain at least one question word or be interrogative
+    # Should have reasonable length
+    words = question.split()
+    if len(words) < 2:  # Very minimal requirement
+        return False
+    
+    # If it contains basic question structure, accept it
     question_lower = question.lower()
     
     question_indicators = [
@@ -246,40 +266,19 @@ def is_valid_question(question):
         'bisakah', 'dapatkah', 'haruskah', 'akankah'
     ]
     
-    # Check for question words
+    # Check for question words (more lenient)
     has_question_word = any(word in question_lower for word in question_indicators)
     
-    # Check for interrogative structure (starts with question word)
-    starts_with_question = any(question_lower.startswith(word) for word in question_indicators)
+    # If it has question words, accept it
+    if has_question_word:
+        return True
     
-    # Check if it's not just a statement with question mark
-    if not has_question_word and not starts_with_question:
-        return False
+    # If it doesn't have obvious question words but ends with ?, 
+    # and has reasonable length, accept it (could be implicit question)
+    if len(words) >= 3:
+        return True
     
-    # Should have reasonable length and structure
-    words = question.split()
-    if len(words) < 3:  # Too short
-        return False
-    
-    return True
-
-def simple_summarize(text, max_sentences=3):
-    """Fallback: simple sentence-based summarization"""
-    sentences = text.split('. ')
-    if len(sentences) <= max_sentences:
-        return text
-    
-    # Ambil kalimat pertama, tengah, dan akhir
-    selected = []
-    if len(sentences) > 0:
-        selected.append(sentences[0])  # Kalimat pertama
-    if len(sentences) > 2:
-        mid = len(sentences) // 2
-        selected.append(sentences[mid])  # Kalimat tengah
-    if len(sentences) > 1:
-        selected.append(sentences[-1] if sentences[-1] else sentences[-2])  # Kalimat akhir
-    
-    return '. '.join(selected) + '.'
+    return False
 
 @app.route('/', methods=['GET'])
 def home():
@@ -292,9 +291,80 @@ def home():
             "summarization": "fransiskaarthaa/text-summarize-fix (HF Inference API)",
             "question_generation": "meilanikizana/indonesian-question-generator (Gradio Spaces)"
         },
-        "endpoints": ["/summarize", "/generate-questions", "/process-text"],
+        "endpoints": ["/summarize", "/generate-questions", "/process-text", "/test-gradio"],
         "note": "Using HuggingFace Inference API for summarization and Gradio Spaces for question generation"
     })
+
+@app.route('/test-gradio', methods=['GET'])
+def test_gradio():
+    """Test endpoint untuk Gradio connection"""
+    try:
+        success = test_gradio_connection()
+        return jsonify({
+            "gradio_test": "success" if success else "failed",
+            "space_url": GRADIO_SPACE_URL,
+            "status": "connected" if success else "connection_failed"
+        })
+    except Exception as e:
+        return jsonify({
+            "gradio_test": "failed",
+            "error": str(e),
+            "space_url": GRADIO_SPACE_URL
+        }), 500
+
+@app.route('/generate-questions', methods=['POST'])
+def generate_questions():
+    """Endpoint untuk question generation menggunakan Gradio Spaces"""
+    try:
+        data = request.get_json()
+        
+        if not data or 'text' not in data:
+            return jsonify({"error": "Field 'text' required"}), 400
+        
+        text = data['text'].strip()
+        if not text:
+            return jsonify({"error": "Text cannot be empty"}), 400
+        
+        if len(text) < 10:  # Relaxed minimum length
+            return jsonify({"error": "Text too short for question generation"}), 400
+            
+        num_questions = min(data.get('num_questions', 3), 10)  # Limit max 10
+        
+        logger.info(f"Processing request - Text length: {len(text)}, Num questions: {num_questions}")
+        
+        questions = generate_questions_with_gradio(text, num_questions)
+        
+        if questions and len(questions) > 0:
+            return jsonify({
+                "questions": questions,
+                "method": "Gradio Spaces",
+                "gradio_space": GRADIO_SPACE_URL,
+                "question_count": len(questions),
+                "text_length": len(text),
+                "status": "success"
+            })
+        else:
+            # Tambahkan informasi debug
+            return jsonify({
+                "error": "Failed to generate questions from Gradio Spaces",
+                "debug_info": {
+                    "text_length": len(text),
+                    "num_questions_requested": num_questions,
+                    "gradio_space": GRADIO_SPACE_URL,
+                    "suggestion": "Try testing the /test-gradio endpoint first"
+                }
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"Error in generate_questions: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        return jsonify({
+            "error": "Server error occurred",
+            "details": str(e)
+        }), 500
+
+# ... (rest of the code remains the same)
 
 @app.route('/summarize', methods=['POST'])
 def summarize():
@@ -343,153 +413,22 @@ def summarize():
         logger.error(f"Error: {e}")
         return jsonify({"error": "Server error occurred"}), 500
 
-@app.route('/generate-questions', methods=['POST'])
-def generate_questions():
-    """Endpoint untuk question generation menggunakan Gradio Spaces"""
-    try:
-        data = request.get_json()
-        
-        if not data or 'text' not in data:
-            return jsonify({"error": "Field 'text' required"}), 400
-        
-        text = data['text'].strip()
-        if not text:
-            return jsonify({"error": "Text cannot be empty"}), 400
-        
-        if len(text) < 30:
-            return jsonify({"error": "Text too short for question generation"}), 400
-            
-        num_questions = min(data.get('num_questions', 3), 10)  # Limit max 10
-        
-        questions = generate_questions_with_gradio(text, num_questions)
-        
-        if questions and len(questions) > 0:
-            return jsonify({
-                "questions": questions,
-                "method": "Gradio Spaces",
-                "gradio_space": GRADIO_SPACE_URL,
-                "question_count": len(questions),
-                "text_length": len(text),
-                "status": "success"
-            })
-        else:
-            return jsonify({"error": "Failed to generate questions from Gradio Spaces"}), 500
-            
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        return jsonify({"error": "Server error occurred"}), 500
-
-@app.route('/process-text', methods=['POST'])
-def process_text():
-    """Endpoint untuk dual processing (summary + questions)"""
-    if not HF_API_TOKEN:
-        return jsonify({"error": "HF_API_TOKEN not configured"}), 500
-    
-    try:
-        data = request.get_json()
-        
-        if not data or 'text' not in data:
-            return jsonify({"error": "Field 'text' required"}), 400
-        
-        text = data['text'].strip()
-        if not text:
-            return jsonify({"error": "Text cannot be empty"}), 400
-        
-        if len(text) < 50:
-            return jsonify({"error": "Text too short for processing"}), 400
-            
-        # Parameters
-        length_mapping = {
-            "short": 100,
-            "medium": 150,
-            "long": 200
-        }
-        
-        length = data.get('length', 'medium')
-        max_length = length_mapping.get(length, 150)
-        num_questions = min(data.get('num_questions', 3), 10)
-        include_questions = data.get('include_questions', True)
-        processing_mode = data.get('mode', 'parallel')  # 'parallel' or 'sequential'
-        
-        summary = None
-        questions = []
-        
-        if processing_mode == 'parallel':
-            # Parallel processing using ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                # Submit both tasks
-                future_summary = executor.submit(summarize_with_api, text, max_length)
-                future_questions = executor.submit(generate_questions_with_gradio, text, num_questions) if include_questions else None
-                
-                # Get results
-                try:
-                    summary = future_summary.result(timeout=60)  # 60 second timeout for Gradio
-                except Exception as e:
-                    logger.error(f"Summary API failed: {e}")
-                    summary = None
-                
-                if future_questions:
-                    try:
-                        questions = future_questions.result(timeout=60)  # 60 second timeout for Gradio
-                    except Exception as e:
-                        logger.error(f"Questions API failed: {e}")
-                        questions = None
-        
-        else:  # Sequential processing
-            # Get summary first
-            summary = summarize_with_api(text, max_length)
-            
-            # Generate questions from original text
-            if include_questions:
-                questions = generate_questions_with_gradio(text, num_questions)
-        
-        # Check if we got results
-        if not summary:
-            return jsonify({"error": "Failed to generate summary from HuggingFace API"}), 500
-        
-        if include_questions and (not questions or len(questions) == 0):
-            return jsonify({"error": "Failed to generate questions from Gradio Spaces"}), 500
-        
-        # Prepare response
-        response = {
-            "original_text": text,
-            "summary": summary,
-            "original_length": len(text),
-            "summary_length": len(summary),
-            "compression_ratio": f"{len(summary)/len(text)*100:.1f}%",
-            "method": {
-                "summarization": "HuggingFace Inference API",
-                "question_generation": "Gradio Spaces"
-            },
-            "processing_mode": processing_mode,
-            "status": "success"
-        }
-        
-        if include_questions:
-            response.update({
-                "questions": questions,
-                "question_count": len(questions) if questions else 0
-            })
-        
-        return jsonify(response)
-        
-    except Exception as e:
-        logger.error(f"Error in process_text: {e}")
-        return jsonify({"error": "Server error occurred"}), 500
-
 @app.route('/health', methods=['GET'])
 def health():
     """Health check untuk monitoring"""
+    gradio_status = test_gradio_connection()
+    
     return jsonify({
-        "status": "healthy" if HF_API_TOKEN else "missing_token",
+        "status": "healthy" if HF_API_TOKEN and gradio_status else "degraded",
         "hf_token_configured": bool(HF_API_TOKEN),
+        "gradio_connection": "connected" if gradio_status else "failed",
         "models": {
             "summarization": "fransiskaarthaa/text-summarize-fix (HF Inference API)",
             "question_generation": f"{GRADIO_SPACE_URL} (Gradio Spaces)"
         },
         "services": {
             "huggingface_inference": "ready" if HF_API_TOKEN else "missing_token",
-            "gradio_spaces": "ready"
+            "gradio_spaces": "ready" if gradio_status else "connection_failed"
         }
     })
 
@@ -505,19 +444,22 @@ if __name__ == "__main__":
     print("   GET  / - Status & Info")
     print("   POST /summarize - Text summarization (HF Inference API)") 
     print("   POST /generate-questions - Question generation (Gradio Spaces)")
-    print("   POST /process-text - Dual processing (summary + questions)")
+    print("   GET  /test-gradio - Test Gradio connection")
     print("   GET  /health - Health check")
     print("✨ Features:")
     print("   🎯 HuggingFace Inference API + Gradio Spaces")
-    print("   🔧 Clean error handling")
-    print("   ⚡ Parallel processing support")
+    print("   🔧 Enhanced error handling & debugging")
+    print("   🧪 Gradio connection testing")
     
     if not HF_API_TOKEN:
         print("❌ WARNING: HF_API_TOKEN not configured for summarization!")
-        print("   Summarization will not work without HF token")
     else:
-        print("✅ HF_API_TOKEN configured - Ready to use HuggingFace Inference API")
+        print("✅ HF_API_TOKEN configured")
     
-    print("✅ Gradio Spaces configured - Ready to use question generation")
+    print("🧪 Testing Gradio connection...")
+    if test_gradio_connection():
+        print("✅ Gradio Spaces connection successful")
+    else:
+        print("❌ WARNING: Gradio Spaces connection failed")
     
     app.run(host='0.0.0.0', port=port, debug=False)
